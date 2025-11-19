@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulasi Black Hole (Three.js + GLSL)</title>
+    <style>
+        body { margin: 0; background-color: #000; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <!-- 1. Impor Library Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <!-- 2. Shader GLSL kita (Vertex Shader Sederhana) -->
+    <script id="vertexShader" type="x-shader/x-vertex">
+        // Vertex shader ini hanya menggambar quad layar penuh
+        void main() {
+            gl_Position = vec4(position, 1.0);
+        }
+    </script>
+
+    <!-- 3. Shader GLSL kita (FISIKA UTAMA DARI BLACKHOLE.FRAG) -->
+    <script id="fragmentShader" type="x-shader/x-fragment">
+        // --- Uniform (Input dari JavaScript) ---
+        uniform vec2 u_resolution;
+        uniform float u_time;
+        uniform vec3 u_cam_pos;
+        uniform vec3 u_cam_lookat;
+        uniform sampler2D u_sky_tex;
+
+        // --- Konstanta Fisika (SAMA PERSIS) ---
+        const float G = 1.0;
+        const float M = 10.0;
+        const float C = 10.0; 
+        const float C2 = C * C; 
+        const float RS = 2.0 * G * M / C2; // (RS = 0.2)
+        const float SHADOW_R = RS * 2.5; // (SHADOW_R = 0.5)
+        const int MAX_STEPS = 100;
+        const float MAX_DIST = 100.0;
+        const float DT = 0.05;
+
+        // --- Konstanta Disk (SAMA PERSIS) ---
+        const float MIN_DISK_R = RS * 3.0; // (0.6)
+        const float MAX_DISK_R = 9.0;
+        const float DISK_V_MAX = C * 0.6;
+        
+        // --- Fungsi Noise FBM (SAMA PERSIS) ---
+        vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+        vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+        vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+        float snoise(vec2 v) {
+            const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
+            vec2 i  = floor(v + dot(v, C.yy)); vec2 x0 = v - i + dot(i, C.xx);
+            vec2 i1; i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+            vec4 x12 = x0.xyxy + C.xxzz; x12.xy -= i1; i = mod289(i);
+            vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+            vec3 m = max(0.5 - vec3(dot(x0, x0), dot(x12.xy, x12.xy), dot(x12.zw, x12.zw)), 0.0);
+            m = m*m; m = m*m;
+            vec3 x = 2.0 * fract(p * C.www) - 1.0; vec3 h = abs(x) - 0.5; vec3 ox = floor(x + 0.5);
+            vec3 a0 = x - ox; m *= (1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h));
+            vec3 g; g.x = a0.x * x0.x + h.x * x0.y; g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+            return 130.0 * dot(m, g);
+        }
+        float fbm(vec2 uv) {
+            float value = 0.0; float amplitude = 0.5; float frequency = 2.0;
+            int octaves = 6;
+            for (int i = 0; i < octaves; i++) {
+                value += amplitude * snoise(uv * frequency);
+                amplitude *= 0.5; frequency *= 2.0;
+            }
+            return (value + 1.0) * 0.5;
+        }
+
+        // --- Fungsi Kamera (SAMA PERSIS) ---
+        vec3 setup_camera(vec2 uv) {
+            vec3 w = normalize(u_cam_lookat - u_cam_pos);
+            vec3 u = normalize(cross(w, vec3(0.0, 1.0, 0.0)));
+            vec3 v = cross(u, w);
+            float fov = 1.0; 
+            vec3 dir = normalize(uv.x * u + uv.y * v + fov * w);
+            return dir;
+        }
+        
+        // --- Fungsi Skybox (Ganti 'texture' -> 'texture2D') ---
+        vec4 sample_sky(vec3 dir) {
+            float u = 0.5 + atan(dir.z, dir.x) / (2.0 * 3.14159265);
+            float v = 0.5 - asin(dir.y) / 3.14159265;
+            return texture2D(u_sky_tex, vec2(u, v));
+        }
+
+        // --- Fungsi Disk (Ganti 'texture' -> 'texture2D') ---
+        vec4 sample_disk(vec3 pos, float r, vec3 view_dir) {
+            float theta = atan(pos.z, pos.x);
+            float v_scalar = DISK_V_MAX * sqrt(MIN_DISK_R / r);
+            vec3 v_dir = normalize(vec3(-pos.z, 0.0, pos.x));
+            float gamma = 1.0 / sqrt(1.0 - (v_scalar * v_scalar) / C2);
+            float v_dot_d = dot(v_dir * v_scalar, view_dir);
+            float doppler_factor = 1.0 / (gamma * (1.0 - v_dot_d / C));
+            float brightness_scale = pow(doppler_factor, 3.0);
+            vec2 noise_uv = vec2(theta * 1.5, r * 0.5);
+            noise_uv.x += (u_time * -0.5) / (log(r) + 1.0);
+            float noise_val = fbm(noise_uv);
+            float noise_contrast = pow(noise_val, 3.0);
+            float temp_t = (r - MIN_DISK_R) / (MAX_DISK_R - MIN_DISK_R);
+            temp_t = clamp(1.0 - temp_t, 0.0, 1.0); 
+            vec3 color_hot_base = vec3(0.6, 0.1, 0.0);
+            vec3 color_hot_highlight = vec3(1.0, 1.0, 0.8);
+            vec3 color_cool_base = vec3(0.1, 0.0, 0.0);
+            vec3 color_cool_highlight = vec3(0.8, 0.2, 0.0);
+            vec3 color_base = mix(color_cool_base, color_hot_base, temp_t);
+            vec3 color_highlight = mix(color_cool_highlight, color_hot_highlight, temp_t);
+            vec3 color = mix(color_base, color_highlight, noise_contrast);
+            color *= brightness_scale;
+            float fade_in = smoothstep(MIN_DISK_R, MIN_DISK_R + 0.2, r);
+            float fade_out = 1.0 - smoothstep(MAX_DISK_R - 0.5, MAX_DISK_R, r);
+            float alpha = fade_in * fade_out;
+            return vec4(color, alpha);
+        }
+
+        // --- FUNGSI FISIKA: Post-Newtonian (SAMA PERSIS) ---
+        vec3 get_acceleration_GR(vec3 pos, vec3 vel) {
+            float r2 = dot(pos, pos);
+            float r = sqrt(r2);
+            if (r < RS + 0.01) { return vec3(0.0); }
+            float newton_force = -G * M / r2;
+            vec3 L = cross(pos, vel);
+            float L2 = dot(L, L);
+            float gr_correction = (1.0 + (3.0 * L2) / (r2 * C2));
+            vec3 accel_gravity = normalize(pos) * newton_force * gr_correction;
+            return accel_gravity;
+        }
+
+        // --- FUNGSI INTEGRATOR RK4 (SAMA PERSIS) ---
+        struct Derivative { vec3 d_pos; vec3 d_vel; };
+        struct State { vec3 pos; vec3 vel; };
+
+        Derivative get_derivative(State s) {
+            Derivative d;
+            d.d_pos = s.vel;
+            d.d_vel = get_acceleration_GR(s.pos, s.vel);
+            return d;
+        }
+        
+        State rk4_step(State s, float dt) {
+            Derivative k1 = get_derivative(s);
+            State s_k2;
+            s_k2.pos = s.pos + k1.d_pos * 0.5 * dt;
+            s_k2.vel = s.vel + k1.d_vel * 0.5 * dt;
+            Derivative k2 = get_derivative(s_k2);
+            State s_k3;
+            s_k3.pos = s.pos + k2.d_pos * 0.5 * dt;
+            s_k3.vel = s.vel + k2.d_vel * 0.5 * dt;
+            Derivative k3 = get_derivative(s_k3);
+            State s_k4;
+            s_k4.pos = s.pos + k3.d_pos * dt;
+            s_k4.vel = s.vel + k3.d_vel * dt;
+            Derivative k4 = get_derivative(s_k4);
+            State s_new;
+            s_new.pos = s.pos + (k1.d_pos + 2.0*k2.d_pos + 2.0*k3.d_pos + k4.d_pos) * (dt / 6.0);
+            s_new.vel = s.vel + (k1.d_vel + 2.0*k2.d_vel + 2.0*k3.d_vel + k4.d_vel) * (dt / 6.0);
+            return s_new;
+        }
+
+        // --- FUNGSI UTAMA (main) ---
+        // (Ganti 'out vec4 f_color' -> 'gl_FragColor')
+        void main() {
+            vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution.xy) / u_resolution.y;
+
+            State s;
+            s.pos = u_cam_pos;
+            s.vel = setup_camera(uv) * C;
+            
+            State s_prev = s; 
+
+            for (int i = 0; i < MAX_STEPS; i++) {
+                float r = length(s.pos);
+                
+                if (r <= SHADOW_R) {
+                    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); 
+                    return;
+                }
+                
+                bool crossed_plane = (s_prev.pos.y > 0.0 && s.pos.y <= 0.0) || 
+                                     (s_prev.pos.y < 0.0 && s.pos.y >= 0.0);
+                                     
+                if (crossed_plane && r > MIN_DISK_R && r < MAX_DISK_R) {
+                    vec3 view_dir = normalize(s.vel);
+                    vec4 disk_color = sample_disk(s.pos, r, view_dir);
+                    vec4 sky_color = sample_sky(view_dir); 
+                    gl_FragColor = mix(sky_color, disk_color, disk_color.a);
+                    return;
+                }
+
+                if (r > MAX_DIST) {
+                    gl_FragColor = sample_sky(normalize(s.vel));
+                    return;
+                }
+                
+                s_prev = s; 
+                s = rk4_step(s, DT);
+            }
+            
+            gl_FragColor = sample_sky(normalize(s.vel));
+        }
+
+    </script>
+
+    <!-- 4. Logika JavaScript (Host Pengganti Python) -->
+    <script type="module">
+        let scene, camera, renderer, material;
+        let uniforms;
+        
+        // Variabel status kamera (sama seperti di Python)
+        let cam_radius = 20.0;
+        let cam_azimuth = Math.PI / 4.0;
+        let cam_elevation = Math.PI / 6.0;
+        let mouse_pressed = false;
+        let mouse_sensitivity = 0.005;
+        let zoom_sensitivity = 1.0;
+        let last_mouse_x = 0;
+        let last_mouse_y = 0;
+        
+        const clock = new THREE.Clock();
+
+        function init() {
+            // Setup scene
+            scene = new THREE.Scene();
+            
+            // Setup kamera dummy (hanya untuk quad)
+            camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+            // Setup renderer
+            renderer = new THREE.WebGLRenderer();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Muat tekstur skybox
+            const loader = new THREE.TextureLoader();
+            const skyTexture = loader.load(
+                'skybox.jpg', // PASTIKAN 'skybox.jpg' ADA DI FOLDER YANG SAMA
+                () => {
+                    // Beritahu Three.js agar memetakan skybox dengan benar
+                    skyTexture.mapping = THREE.EquirectangularReflectionMapping;
+                    animate(); // Mulai animasi HANYA setelah tekstur dimuat
+                },
+                undefined,
+                () => {
+                    console.error("Gagal memuat skybox.jpg. Pastikan file ada di folder yang sama.");
+                    alert("Gagal memuat 'skybox.jpg'. Pastikan file ada di folder yang sama dengan index.html ini.");
+                }
+            );
+
+            // Setup Uniform (penghubung JS ke GLSL)
+            uniforms = {
+                u_time: { value: 0.0 },
+                u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                u_cam_pos: { value: new THREE.Vector3(0, 0, 0) }, // Akan di-update di animate()
+                u_cam_lookat: { value: new THREE.Vector3(0, 0, 0) }, // Selalu 0,0,0
+                u_sky_tex: { value: skyTexture }
+            };
+
+            // Buat material shader
+            material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('fragmentShader').textContent
+            });
+
+            // Buat quad (bidang 2D) layar penuh
+            const geometry = new THREE.PlaneBufferGeometry(2, 2);
+            const quad = new THREE.Mesh(geometry, material);
+            scene.add(quad);
+
+            // Tambahkan event listener (pengganti pyglet)
+            window.addEventListener('resize', onWindowResize);
+            document.addEventListener('mousedown', onMouseDown);
+            document.addEventListener('mouseup', onMouseUp);
+            document.addEventListener('mousemove', onMouseMove); // Ganti drag ke move
+            document.addEventListener('wheel', onMouseWheel);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Update waktu
+            uniforms.u_time.value = clock.getElapsedTime();
+
+            // Update posisi kamera (logika orbit SAMA PERSIS seperti Python)
+            const cam_x = cam_radius * Math.cos(cam_elevation) * Math.sin(cam_azimuth);
+            const cam_y = cam_radius * Math.sin(cam_elevation);
+            const cam_z = cam_radius * Math.cos(cam_elevation) * Math.cos(cam_azimuth);
+            
+            uniforms.u_cam_pos.value.set(cam_x, cam_y, cam_z);
+
+            renderer.render(scene, camera);
+        }
+        
+        // --- Fungsi Event Listener (Pengganti Pyglet) ---
+
+        function onWindowResize() {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            uniforms.u_resolution.value.x = window.innerWidth;
+            uniforms.u_resolution.value.y = window.innerHeight;
+        }
+
+        function onMouseDown(event) {
+            if (event.button === 0) { // Tombol kiri
+                mouse_pressed = true;
+                last_mouse_x = event.clientX;
+                last_mouse_y = event.clientY;
+            }
+        }
+        
+        function onMouseUp(event) {
+            if (event.button === 0) {
+                mouse_pressed = false;
+            }
+        }
+        
+        function onMouseMove(event) {
+            if (!mouse_pressed) return;
+            
+            const dx = event.clientX - last_mouse_x;
+            const dy = event.clientY - last_mouse_y;
+
+            cam_azimuth += dx * mouse_sensitivity;
+            cam_elevation -= dy * mouse_sensitivity;
+            cam_elevation = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, cam_elevation));
+            
+            last_mouse_x = event.clientX;
+            last_mouse_y = event.clientY;
+        }
+        
+        function onMouseWheel(event) {
+            cam_radius -= event.deltaY * 0.01 * zoom_sensitivity; // 'deltaY' diskalakan
+            cam_radius = Math.max(3.0, cam_radius);
+        }
+
+        // Mulai
+        init();
+    </script>
+</body>
+</html>
